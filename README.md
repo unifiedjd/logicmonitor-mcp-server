@@ -9,6 +9,16 @@ Model Context Protocol (MCP) server for LogicMonitor - enables AI assistants to 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.6-blue)](https://www.typescriptlang.org/)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-green)](https://nodejs.org/)
 
+> [!IMPORTANT]
+> 
+> 🛠️ **Managed & Supported by [Monitoring Artist](https://www.monitoringartist.com)**
+>
+> This MCP server is an independent, community-driven innovation by Monitoring Artist.
+>
+> **Official Support Disclaimer:** This project is not an official LogicMonitor product and is not covered by LogicMonitor’s standard support tiers.
+> 
+> **Need Enterprise-Grade Reliability?** > Monitoring Artist provides professional implementation, custom feature development, and dedicated support for this integration. [Partner with us for expert solutions](https://www.monitoringartist.com).
+
 ## Features
 
 - **125 MCP Tools** for comprehensive LogicMonitor operations (73 read-only, 52 write)
