@@ -377,6 +377,11 @@ export class LogicMonitorHandlers {
             }
           }
 
+          // Add cleared filter if requested
+          if (args.cleared === true) {
+            filter = filter ? `${filter},cleared:true` : 'cleared:true';
+          }
+
           const result = await this.client.listAlerts({
             size: args.size,
             offset: args.offset,
