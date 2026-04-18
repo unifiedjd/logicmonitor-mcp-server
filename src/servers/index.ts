@@ -394,6 +394,15 @@ if (TRANSPORT === 'stdio') {
   // Disable X-Powered-By header for security
   app.disable('x-powered-by');
 
+  // Trust reverse proxy (Azure Container Apps, Cloudflare, etc.) so that
+  // req.ip and X-Forwarded-For are honored correctly by express-rate-limit.
+  // Set EXPRESS_TRUST_PROXY to a number of hops, a CIDR, "true", or leave unset.
+  const trustProxy = process.env.EXPRESS_TRUST_PROXY;
+  if (trustProxy) {
+    const numeric = Number(trustProxy);
+    app.set('trust proxy', Number.isFinite(numeric) ? numeric : trustProxy === 'true' ? true : trustProxy);
+  }
+
   // Request/Response logging middleware
   app.use((req: Request, res: Response, next: NextFunction) => {
     const startTime = Date.now();
@@ -958,11 +967,11 @@ if (TRANSPORT === 'stdio') {
   // OAuth routes (if configured)
   if (oauthConfig) {
     const scopeArray = oauthConfig.scope ? oauthConfig.scope.split(',') : undefined;
-    app.get('/auth/login', loginLimiter, passport.authenticate(oauthConfig.provider === 'custom' ? 'oauth2' : oauthConfig.provider, { scope: scopeArray }));
+    app.get('/auth/login', loginLimiter, passport.authenticate(oauthConfig.provider, { scope: scopeArray }));
 
     app.get(
       '/auth/callback',
-      passport.authenticate(oauthConfig.provider === 'custom' ? 'oauth2' : oauthConfig.provider, { failureRedirect: '/' }),
+      passport.authenticate(oauthConfig.provider, { failureRedirect: '/' }),
       (req: Request, res: Response) => {
         if (req.user && req.session) {
           const user = req.user as OAuthUser;
