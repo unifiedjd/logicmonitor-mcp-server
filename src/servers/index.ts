@@ -49,6 +49,18 @@ import { parseConfig, validateConfig } from '../utils/core/cli-config.js';
 import { configureOAuthStrategy, getRefreshTokenFunction, OAuthUser } from '../utils/core/oauth-strategy.js';
 import { getJWTValidator, isJWT } from '../utils/core/jwt-validator.js';
 import { ScopeManager } from '../utils/core/scope-manager.js';
+import {
+  registerClient,
+  getClient,
+  issueAuthorizationCode,
+  consumeAuthorizationCode,
+  verifyPkceS256,
+  buildProtectedResourceMetadata,
+  buildAuthorizationServerMetadata,
+  startOAuthCleanup,
+  PENDING_AUTH_TTL_MS,
+  PendingAuthorization,
+} from '../utils/core/oauth-as.js';
 import { isMCPError, formatErrorForUser } from '../utils/core/error-handler.js';
 import { createServer } from './server.js';
 
@@ -462,6 +474,8 @@ if (TRANSPORT === 'stdio') {
 
   app.use(express.json());
   app.use(express.text({ type: 'application/json' }));
+  // application/x-www-form-urlencoded is required for OAuth 2.1 /oauth/token
+  app.use(express.urlencoded({ extended: true }));
 
   // Cookie parser middleware (required for CSRF protection)
   app.use(cookieParser());
@@ -529,8 +543,10 @@ if (TRANSPORT === 'stdio') {
     // Uses cookie-based CSRF tokens for better security
     // Exclude MCP endpoints from CSRF protection as they use Bearer token authentication
     app.use((req: Request, res: Response, next: NextFunction) => {
-      // Skip CSRF for MCP endpoints and API routes that use Bearer tokens
+      // Skip CSRF for MCP endpoints and API routes that use Bearer tokens,
+      // OAuth AS endpoints (Claude and other OAuth 2.1 clients), and discovery
       if (req.path.startsWith('/mcp') || req.path.startsWith('/.well-known/') ||
+          req.path.startsWith('/oauth/') ||
           req.path === '/healthz' || req.path === '/health' || req.path === '/') {
         return next();
       }
@@ -997,6 +1013,52 @@ if (TRANSPORT === 'stdio') {
           }
         }
 
+        // If this callback is part of an OAuth 2.1 authorization code flow
+        // initiated by an MCP client (e.g. Claude's remote connector) via
+        // /oauth/authorize, mint an authorization code and redirect back to
+        // the client's registered redirect_uri. Otherwise, fall back to the
+        // legacy browser flow that lands the user on '/'.
+        const pending = (req.session as any)?.pendingAuth as PendingAuthorization | undefined;
+        if (pending && req.user) {
+          // Enforce TTL
+          if (Date.now() - pending.createdAt > PENDING_AUTH_TTL_MS) {
+            delete (req.session as any).pendingAuth;
+            log('warn', 'Pending OAuth authorization expired', { clientId: pending.clientId });
+            const expiredUrl = new URL(pending.redirectUri);
+            expiredUrl.searchParams.set('error', 'access_denied');
+            expiredUrl.searchParams.set('error_description', 'authorization request expired');
+            if (pending.state) expiredUrl.searchParams.set('state', pending.state);
+            return res.redirect(expiredUrl.toString());
+          }
+
+          const oauthUser = req.user as OAuthUser;
+          const code = issueAuthorizationCode({
+            clientId: pending.clientId,
+            redirectUri: pending.redirectUri,
+            codeChallenge: pending.codeChallenge,
+            codeChallengeMethod: pending.codeChallengeMethod,
+            scope: DEFAULT_USER_SCOPE,
+            user: {
+              id: oauthUser.id,
+              username: oauthUser.username,
+              displayName: oauthUser.displayName,
+              email: oauthUser.email,
+            },
+          });
+
+          delete (req.session as any).pendingAuth;
+
+          const redirectUrl = new URL(pending.redirectUri);
+          redirectUrl.searchParams.set('code', code);
+          if (pending.state) redirectUrl.searchParams.set('state', pending.state);
+
+          log('info', 'Issued authorization code to MCP client', {
+            clientId: pending.clientId,
+            user: oauthUser.username || oauthUser.id,
+          });
+          return res.redirect(redirectUrl.toString());
+        }
+
         res.redirect('/');
       },
     );
@@ -1012,6 +1074,244 @@ if (TRANSPORT === 'stdio') {
       // The CSRF token is automatically available in res.locals._csrf by lusca
       res.json({
         csrfToken: res.locals._csrf || (req as any).csrfToken?.() || null,
+      });
+    });
+
+    // ================================================================
+    // OAuth 2.1 Authorization Server endpoints (for MCP clients)
+    // ================================================================
+    // These let OAuth 2.1 clients like Claude's remote MCP connector
+    // authenticate end-users through the server's configured IdP
+    // (Microsoft Entra, etc.) and receive a server-minted JWT they
+    // can present as a Bearer token on /mcp requests.
+    //
+    // Flow:
+    //   1. Client hits /mcp → 401 with WWW-Authenticate advertising
+    //      /.well-known/oauth-protected-resource
+    //   2. Client discovers AS via /.well-known/oauth-authorization-server
+    //   3. Client registers via POST /oauth/register (RFC 7591 DCR)
+    //   4. Client redirects user to /oauth/authorize with PKCE challenge
+    //   5. Server federates to Microsoft; on return, /auth/callback
+    //      mints an authorization code and redirects to the client
+    //   6. Client exchanges code at POST /oauth/token → JWT access token
+
+    const SCOPES_SUPPORTED = [
+      'mcp:tools',
+      'lm:read', 'lm:write', 'lm:admin',
+      'lm:alerts:read', 'lm:alerts:write',
+      'lm:devices:read', 'lm:devices:write',
+      'lm:dashboards:read', 'lm:dashboards:write',
+      'lm:reports:read',
+      'lm:users:manage',
+    ];
+
+    // TODO(option-3): replace this fixed scope with a mapping derived
+    // from the authenticated user's Entra group memberships. For now
+    // every Entra-authenticated user gets the full scope set so that
+    // every LM tool is reachable; LM's own RBAC still applies via the
+    // shared LM_BEARER_TOKEN.
+    const DEFAULT_USER_SCOPE = [
+      'mcp:tools',
+      'lm:admin',
+      'lm:alerts:write',
+      'lm:devices:write',
+      'lm:dashboards:write',
+      'lm:users:manage',
+    ].join(' ');
+
+    // --- Discovery: RFC 9728 Protected Resource Metadata ---
+    app.get('/.well-known/oauth-protected-resource', (req: Request, res: Response) => {
+      res.json(buildProtectedResourceMetadata(BASE_URL, SCOPES_SUPPORTED));
+    });
+
+    // --- Discovery: RFC 8414 Authorization Server Metadata ---
+    app.get('/.well-known/oauth-authorization-server', (req: Request, res: Response) => {
+      res.json(buildAuthorizationServerMetadata(BASE_URL, SCOPES_SUPPORTED));
+    });
+
+    // --- RFC 7591 Dynamic Client Registration ---
+    app.post('/oauth/register', authLimiter, (req: Request, res: Response) => {
+      const body = req.body || {};
+      const redirectUris: unknown = body.redirect_uris;
+      const clientName: unknown = body.client_name;
+      const scope: unknown = body.scope;
+
+      if (!Array.isArray(redirectUris) || redirectUris.length === 0) {
+        return res.status(400).json({
+          error: 'invalid_redirect_uri',
+          error_description: 'redirect_uris (non-empty array) is required',
+        });
+      }
+
+      for (const uri of redirectUris) {
+        if (typeof uri !== 'string') {
+          return res.status(400).json({
+            error: 'invalid_redirect_uri',
+            error_description: 'redirect_uris must be strings',
+          });
+        }
+        try {
+          new URL(uri);
+        } catch {
+          return res.status(400).json({
+            error: 'invalid_redirect_uri',
+            error_description: `malformed redirect_uri: ${uri}`,
+          });
+        }
+      }
+
+      const reg = registerClient({
+        redirectUris: redirectUris as string[],
+        clientName: typeof clientName === 'string' ? clientName : undefined,
+        scope: typeof scope === 'string' ? scope : undefined,
+      });
+
+      log('info', 'OAuth client registered', {
+        clientId: reg.clientId,
+        clientName: reg.clientName,
+        redirectUris: reg.redirectUris,
+      });
+
+      res.status(201).json({
+        client_id: reg.clientId,
+        client_id_issued_at: reg.clientIdIssuedAt,
+        redirect_uris: reg.redirectUris,
+        client_name: reg.clientName,
+        token_endpoint_auth_method: reg.tokenEndpointAuthMethod,
+        grant_types: reg.grantTypes,
+        response_types: reg.responseTypes,
+        scope: reg.scope,
+      });
+    });
+
+    // --- Authorization endpoint (OAuth 2.1 + PKCE) ---
+    app.get('/oauth/authorize', loginLimiter, (req: Request, res: Response, next: NextFunction) => {
+      const {
+        response_type,
+        client_id,
+        redirect_uri,
+        code_challenge,
+        code_challenge_method,
+        scope,
+        state,
+      } = req.query as Record<string, string | undefined>;
+
+      // Pre-client validation → direct 400 (no redirect)
+      if (!client_id) {
+        return res.status(400).json({ error: 'invalid_request', error_description: 'client_id required' });
+      }
+      const client = getClient(client_id);
+      if (!client) {
+        return res.status(400).json({ error: 'invalid_client', error_description: 'unknown client_id' });
+      }
+      if (!redirect_uri || !client.redirectUris.includes(redirect_uri)) {
+        return res.status(400).json({ error: 'invalid_request', error_description: 'redirect_uri not registered' });
+      }
+
+      // Post-client validation → redirect to client with error
+      const redirectWithError = (err: string, description: string) => {
+        const url = new URL(redirect_uri);
+        url.searchParams.set('error', err);
+        url.searchParams.set('error_description', description);
+        if (state) url.searchParams.set('state', state);
+        return res.redirect(url.toString());
+      };
+
+      if (response_type !== 'code') {
+        return redirectWithError('unsupported_response_type', 'only response_type=code is supported');
+      }
+      if (!code_challenge) {
+        return redirectWithError('invalid_request', 'code_challenge is required (PKCE)');
+      }
+      if (code_challenge_method !== 'S256') {
+        return redirectWithError('invalid_request', 'code_challenge_method must be S256');
+      }
+
+      // Stash the pending authorization in the user's browser session so we
+      // can pick it back up after Microsoft redirects to /auth/callback.
+      (req.session as any).pendingAuth = {
+        clientId: client_id,
+        redirectUri: redirect_uri,
+        codeChallenge: code_challenge,
+        codeChallengeMethod: 'S256',
+        scope: scope || 'mcp:tools',
+        state,
+        createdAt: Date.now(),
+      } satisfies PendingAuthorization;
+
+      log('info', 'Starting MCP-client OAuth authorization', {
+        clientId: client_id,
+        redirectUri: redirect_uri,
+        scope,
+      });
+
+      // Kick off Microsoft (or configured IdP) auth — same as /auth/login.
+      const idpScope = oauthConfig!.scope ? oauthConfig!.scope.split(',') : undefined;
+      return passport.authenticate(oauthConfig!.provider, { scope: idpScope })(req, res, next);
+    });
+
+    // --- Token endpoint (authorization_code grant + PKCE) ---
+    app.post('/oauth/token', authLimiter, (req: Request, res: Response) => {
+      // express-urlencoded and express.json both populate req.body, so both
+      // application/x-www-form-urlencoded (per RFC 6749) and application/json
+      // callers are accepted.
+      const body = req.body || {};
+      const grant_type = body.grant_type;
+      const code = body.code;
+      const redirect_uri = body.redirect_uri;
+      const client_id = body.client_id;
+      const code_verifier = body.code_verifier;
+
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('Pragma', 'no-cache');
+
+      if (grant_type !== 'authorization_code') {
+        return res.status(400).json({ error: 'unsupported_grant_type' });
+      }
+      if (!code || !redirect_uri || !client_id || !code_verifier) {
+        return res.status(400).json({
+          error: 'invalid_request',
+          error_description: 'code, redirect_uri, client_id and code_verifier are required',
+        });
+      }
+
+      const record = consumeAuthorizationCode(code);
+      if (!record) {
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'code invalid or expired' });
+      }
+      if (record.clientId !== client_id) {
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
+      }
+      if (record.redirectUri !== redirect_uri) {
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
+      }
+      if (!verifyPkceS256(code_verifier, record.codeChallenge)) {
+        return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+      }
+
+      const accessToken = jwtValidator.createToken({
+        sub: record.user.id,
+        scope: record.scope,
+        user: {
+          id: record.user.id,
+          username: record.user.username || record.user.email || record.user.id,
+          displayName: record.user.displayName,
+          email: record.user.email,
+        },
+        client_id: record.clientId,
+      });
+
+      log('info', 'Issued access token to MCP client', {
+        clientId: record.clientId,
+        user: record.user.username || record.user.id,
+        scope: record.scope,
+      });
+
+      res.json({
+        access_token: accessToken,
+        token_type: 'Bearer',
+        expires_in: 3600,
+        scope: record.scope,
       });
     });
   }
@@ -1545,6 +1845,12 @@ if (TRANSPORT === 'stdio') {
   if (oauthConfig && oauthConfig.tokenRefreshEnabled) {
     startPeriodicCleanup();
     log('info', 'Token refresh system initialized');
+  }
+
+  // Start OAuth AS cleanup (expired auth codes / stale client registrations)
+  if (oauthConfig) {
+    startOAuthCleanup();
+    log('info', 'OAuth authorization server cleanup started');
   }
 
   // Start server
