@@ -58,9 +58,17 @@ import {
   buildProtectedResourceMetadata,
   buildAuthorizationServerMetadata,
   startOAuthCleanup,
+  createTransactionId,
+  storePendingAuthorization,
+  consumePendingAuthorization,
   PENDING_AUTH_TTL_MS,
   PendingAuthorization,
 } from '../utils/core/oauth-as.js';
+
+// Cookie used to carry the OAuth 2.1 transaction id across the IdP round-trip.
+// Kept separate from the Express session so it survives Passport's session
+// regeneration on successful login.
+const OAUTH_TX_COOKIE = 'mcp_oauth_tx';
 import { isMCPError, formatErrorForUser } from '../utils/core/error-handler.js';
 import { createServer } from './server.js';
 
@@ -1018,19 +1026,19 @@ if (TRANSPORT === 'stdio') {
         // /oauth/authorize, mint an authorization code and redirect back to
         // the client's registered redirect_uri. Otherwise, fall back to the
         // legacy browser flow that lands the user on '/'.
-        const pending = (req.session as any)?.pendingAuth as PendingAuthorization | undefined;
-        if (pending && req.user) {
-          // Enforce TTL
-          if (Date.now() - pending.createdAt > PENDING_AUTH_TTL_MS) {
-            delete (req.session as any).pendingAuth;
-            log('warn', 'Pending OAuth authorization expired', { clientId: pending.clientId });
-            const expiredUrl = new URL(pending.redirectUri);
-            expiredUrl.searchParams.set('error', 'access_denied');
-            expiredUrl.searchParams.set('error_description', 'authorization request expired');
-            if (pending.state) expiredUrl.searchParams.set('state', pending.state);
-            return res.redirect(expiredUrl.toString());
-          }
+        //
+        // Pending state is looked up by a transactionId carried in the
+        // OAUTH_TX_COOKIE; this survives Passport's session regeneration
+        // during req.login() unlike anything stored in req.session.
+        const transactionId: string | undefined = req.cookies?.[OAUTH_TX_COOKIE];
+        const pending = transactionId ? consumePendingAuthorization(transactionId) : null;
 
+        if (transactionId) {
+          // Always clear the cookie — success or failure.
+          res.clearCookie(OAUTH_TX_COOKIE, { path: '/' });
+        }
+
+        if (pending && req.user) {
           const oauthUser = req.user as OAuthUser;
           const code = issueAuthorizationCode({
             clientId: pending.clientId,
@@ -1046,8 +1054,6 @@ if (TRANSPORT === 'stdio') {
             },
           });
 
-          delete (req.session as any).pendingAuth;
-
           const redirectUrl = new URL(pending.redirectUri);
           redirectUrl.searchParams.set('code', code);
           if (pending.state) redirectUrl.searchParams.set('state', pending.state);
@@ -1055,8 +1061,15 @@ if (TRANSPORT === 'stdio') {
           log('info', 'Issued authorization code to MCP client', {
             clientId: pending.clientId,
             user: oauthUser.username || oauthUser.id,
+            transactionId,
           });
           return res.redirect(redirectUrl.toString());
+        }
+
+        if (transactionId && !pending) {
+          log('warn', 'OAuth callback had transactionId cookie but no matching pending authorization (expired or already consumed)', {
+            transactionId,
+          });
         }
 
         res.redirect('/');
@@ -1227,9 +1240,13 @@ if (TRANSPORT === 'stdio') {
         return redirectWithError('invalid_request', 'code_challenge_method must be S256');
       }
 
-      // Stash the pending authorization in the user's browser session so we
-      // can pick it back up after Microsoft redirects to /auth/callback.
-      (req.session as any).pendingAuth = {
+      // Stash the pending authorization server-side (keyed by a random
+      // transactionId) and carry the id across the IdP round-trip in a
+      // cookie. Can NOT live in req.session — Passport >= 0.6 regenerates
+      // the session on successful login, which would wipe this data
+      // before /auth/callback runs.
+      const transactionId = createTransactionId();
+      const pendingAuth: PendingAuthorization = {
         clientId: client_id,
         redirectUri: redirect_uri,
         codeChallenge: code_challenge,
@@ -1237,12 +1254,22 @@ if (TRANSPORT === 'stdio') {
         scope: scope || 'mcp:tools',
         state,
         createdAt: Date.now(),
-      } satisfies PendingAuthorization;
+      };
+      storePendingAuthorization(transactionId, pendingAuth);
+
+      res.cookie(OAUTH_TX_COOKIE, transactionId, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        path: '/',
+        maxAge: PENDING_AUTH_TTL_MS,
+      });
 
       log('info', 'Starting MCP-client OAuth authorization', {
         clientId: client_id,
         redirectUri: redirect_uri,
         scope,
+        transactionId,
       });
 
       // Kick off Microsoft (or configured IdP) auth — same as /auth/login.
