@@ -69,6 +69,41 @@ const CLIENT_TTL_MS = 24 * 60 * 60 * 1000 * 30; // 30 days (registrations)
 
 const clients = new Map<string, ClientRegistration>();
 const authCodes = new Map<string, AuthorizationCode>();
+const pendingAuthorizations = new Map<string, PendingAuthorization>();
+
+// ------------------------------------------------------------------
+// Pending authorization storage (server-side, keyed by transactionId)
+// ------------------------------------------------------------------
+//
+// pendingAuth MUST NOT live in req.session: Passport >= 0.6 regenerates
+// the session on successful req.login() for session-fixation defence, so
+// anything stashed in the session before the IdP round-trip is gone by
+// the time /auth/callback runs. Instead we store server-side keyed by
+// a random transactionId that we carry across the IdP redirect in a
+// short-lived, HttpOnly cookie that Passport never touches.
+
+export function createTransactionId(): string {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+export function storePendingAuthorization(
+  transactionId: string,
+  authz: PendingAuthorization,
+): void {
+  pendingAuthorizations.set(transactionId, authz);
+}
+
+export function consumePendingAuthorization(
+  transactionId: string,
+): PendingAuthorization | null {
+  const record = pendingAuthorizations.get(transactionId);
+  if (!record) return null;
+  pendingAuthorizations.delete(transactionId);
+  if (Date.now() - record.createdAt > PENDING_AUTH_TTL_MS) {
+    return null;
+  }
+  return record;
+}
 
 // ------------------------------------------------------------------
 // Client registration
@@ -197,7 +232,7 @@ export function buildAuthorizationServerMetadata(baseUrl: string, scopesSupporte
 // Periodic cleanup
 // ------------------------------------------------------------------
 
-export function cleanupExpired(): { codes: number; clients: number } {
+export function cleanupExpired(): { codes: number; clients: number; pending: number } {
   const now = Date.now();
   let expiredCodes = 0;
   authCodes.forEach((record, code) => {
@@ -215,15 +250,25 @@ export function cleanupExpired(): { codes: number; clients: number } {
     }
   });
 
-  return { codes: expiredCodes, clients: expiredClients };
+  let expiredPending = 0;
+  pendingAuthorizations.forEach((record, txId) => {
+    if (now - record.createdAt > PENDING_AUTH_TTL_MS) {
+      pendingAuthorizations.delete(txId);
+      expiredPending++;
+    }
+  });
+
+  return { codes: expiredCodes, clients: expiredClients, pending: expiredPending };
 }
 
 export function startOAuthCleanup(intervalMs: number = 5 * 60 * 1000): NodeJS.Timeout {
   return setInterval(() => {
-    const { codes, clients: removedClients } = cleanupExpired();
-    if (codes > 0 || removedClients > 0) {
+    const { codes, clients: removedClients, pending } = cleanupExpired();
+    if (codes > 0 || removedClients > 0 || pending > 0) {
       // Use console.error to avoid coupling to the server's log function
-      console.error(`[oauth-as] cleanup: removed ${codes} codes, ${removedClients} clients`);
+      console.error(
+        `[oauth-as] cleanup: removed ${codes} codes, ${removedClients} clients, ${pending} pending`,
+      );
     }
   }, intervalMs);
 }
