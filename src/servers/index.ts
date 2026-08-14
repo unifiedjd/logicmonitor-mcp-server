@@ -54,8 +54,6 @@ import {
   getClient,
   issueAuthorizationCode,
   consumeAuthorizationCode,
-  issueRefreshToken,
-  consumeRefreshToken,
   verifyPkceS256,
   buildProtectedResourceMetadata,
   buildAuthorizationServerMetadata,
@@ -1300,24 +1298,40 @@ if (TRANSPORT === 'stdio') {
       res.setHeader('Pragma', 'no-cache');
 
       // Helper: build the standard token-endpoint response and mint both
-      // access_token (1 hour) and refresh_token (30 days, rotating).
+      // access_token (1 hour) and refresh_token (30 days).
+      //
+      // Refresh tokens are stateless JWTs signed with the same secret as
+      // access tokens (distinguished by token_use: 'refresh'). They survive
+      // container restarts — critical on Azure Container Apps, where
+      // scale-from-zero and redeploys give the process a fresh memory and
+      // previously wiped the old in-memory refresh-token store, forcing
+      // users to reconnect.
       const issueTokenPair = (
         clientId: string,
         scope: string,
         user: { id: string; username?: string; displayName?: string; email?: string },
       ) => {
+        const normalizedUser = {
+          id: user.id,
+          username: user.username || user.email || user.id,
+          displayName: user.displayName,
+          email: user.email,
+        };
         const accessToken = jwtValidator.createToken({
           sub: user.id,
           scope,
-          user: {
-            id: user.id,
-            username: user.username || user.email || user.id,
-            displayName: user.displayName,
-            email: user.email,
-          },
+          user: normalizedUser,
           client_id: clientId,
         });
-        const refreshToken = issueRefreshToken({ clientId, scope, user });
+        const refreshToken = jwtValidator.createRefreshToken(
+          {
+            sub: user.id,
+            scope,
+            user: normalizedUser,
+            client_id: clientId,
+          },
+          Math.floor(REFRESH_TOKEN_TTL_MS / 1000),
+        );
         return {
           access_token: accessToken,
           token_type: 'Bearer',
@@ -1379,26 +1393,33 @@ if (TRANSPORT === 'stdio') {
           });
         }
 
-        const record = consumeRefreshToken(refresh_token);
-        if (!record) {
+        const validation = jwtValidator.validateRefreshToken(refresh_token);
+        if (!validation.valid || !validation.payload) {
           return res.status(400).json({
             error: 'invalid_grant',
-            error_description: 'refresh_token invalid, expired, or revoked',
+            error_description: `refresh_token invalid or expired (${validation.error || 'unknown'})`,
           });
         }
-        if (client_id && record.clientId !== client_id) {
+
+        const payload = validation.payload;
+        if (client_id && payload.client_id && payload.client_id !== client_id) {
           return res.status(400).json({
             error: 'invalid_grant',
             error_description: 'client_id mismatch',
           });
         }
 
-        const tokens = issueTokenPair(record.clientId, record.scope, record.user);
+        const user = payload.user || {
+          id: payload.sub,
+          username: payload.sub,
+        };
+        const scope = payload.scope || 'mcp:tools';
+        const tokens = issueTokenPair(payload.client_id || client_id || 'unknown', scope, user);
 
         log('info', 'Refreshed access token for MCP client (refresh_token)', {
-          clientId: record.clientId,
-          user: record.user.username || record.user.id,
-          scope: record.scope,
+          clientId: payload.client_id,
+          user: user.username || user.id,
+          scope,
         });
 
         return res.json(tokens);

@@ -377,8 +377,12 @@ export class LogicMonitorHandlers {
             }
           }
 
-          // Add cleared filter if requested
-          if (args.cleared === true) {
+          // Add cleared filter if requested — unless the caller's filter
+          // already pins cleared (e.g. filter:"cleared:false" + cleared:true
+          // would otherwise produce the contradictory "cleared:false,cleared:true").
+          // An explicit cleared filter in `filter` always wins.
+          const filterHasCleared = typeof filter === 'string' && /(^|,)\s*cleared\s*[:!<>~]/.test(filter);
+          if (args.cleared === true && !filterHasCleared) {
             filter = filter ? `${filter},cleared:true` : 'cleared:true';
           }
 
